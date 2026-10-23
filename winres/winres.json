@@ -1,0 +1,13 @@
+{
+  "RT_MANIFEST": {
+    "#1": {
+      "0409": {
+        "description": "PCLink G4X log to Virtual Dyno converter",
+        "minimum-os": "win7",
+        "execution-level": "as invoker",
+        "dpi-awareness": "per monitor v2",
+        "use-common-controls-v6": true
+      }
+    }
+  }
+}
