@@ -36,6 +36,13 @@ type app struct {
 	startEdit *walk.LineEdit
 	endEdit  *walk.LineEdit
 
+	cbGearFilter *walk.ComboBox
+	runPanel     *walk.Composite
+	runChecks    []*walk.CheckBox
+	runTags      []int
+	segs         []convert.Segment
+	detectQueued bool
+
 	colList    *walk.ListBox
 	filterEdit *walk.LineEdit
 	extrasEdit *walk.TextEdit
@@ -51,7 +58,7 @@ func runGUI() {
 	mw := &MainWindow{
 		AssignTo: &a.mw,
 		Title:    "PCLink G4X ログ → Virtual Dyno 変換",
-		Size:     Size{Width: 1020, Height: 800},
+		Size:     Size{Width: 1020, Height: 880},
 		Layout:   VBox{},
 		OnDropFiles: func(paths []string) {
 			for _, p := range paths {
@@ -102,7 +109,7 @@ func runGUI() {
 
 					CheckBox{AssignTo: &a.chkWOT, Text: "WOT自動トリム TPS≥", Row: 2, Column: 0},
 					LineEdit{AssignTo: &a.wotEdit, Text: "90", MinSize: Size{Width: 50, Height: 22}, Row: 2, Column: 1},
-					Label{Text: "% の最長区間のみ出力", Row: 2, Column: 2, ColumnSpan: 2},
+					Label{Text: "% の区間を検出して一覧から選択（手動範囲入力時は手動が優先）", Row: 2, Column: 2, ColumnSpan: 2},
 
 					Label{Text: "手動範囲 開始(s):", Row: 3, Column: 0},
 					LineEdit{AssignTo: &a.startEdit, MinSize: Size{Width: 80, Height: 22}, Row: 3, Column: 1},
@@ -111,7 +118,24 @@ func runGUI() {
 				},
 			},
 			GroupBox{
-				Title:  "追加出力列（VDは無視、解析用に残したい列。左で選択→追加。手動範囲入力時はWOTトリムより手動が優先）",
+				Title:  "WOT区間選択（チェックした区間が splitN 付きの個別CSVとして出力されます。1区間=1ファイルがVirtual Dyno向き）",
+				Layout: VBox{},
+				Children: []Widget{
+					Composite{Layout: HBox{},
+						Children: []Widget{
+							PushButton{Text: "区間を検出", OnClicked: a.onDetect},
+							PushButton{Text: "すべて選択", OnClicked: func() { a.setAllChecks(true) }},
+							PushButton{Text: "すべて解除", OnClicked: func() { a.setAllChecks(false) }},
+							HSpacer{Size: 30},
+							Label{Text: "ギアで区間を絞る:"},
+							ComboBox{AssignTo: &a.cbGearFilter, Model: []string{"指定なし", "1", "2", "3", "4", "5", "6", "7", "8"}, MinSize: Size{Width: 60, Height: 22}, OnCurrentIndexChanged: a.onGearFilterChanged},
+						},
+					},
+					Composite{AssignTo: &a.runPanel, Layout: VBox{}, MinSize: Size{Width: 960, Height: 96}},
+				},
+			},
+			GroupBox{
+				Title:  "追加出力列（VDは無視、解析用に残したい列。左で選択→追加）",
 				Layout: VBox{},
 				Children: []Widget{
 					Composite{Layout: HBox{},
@@ -228,6 +252,109 @@ func (a *app) loadFile(path string) {
 	if g.Time < 0 || g.RPM < 0 || g.Speed < 0 {
 		a.log("⚠ 必須列が自動認識できません。上のドロップダウンで選択してください。")
 	}
+	a.onDetect()
+}
+
+// ---- WOT segment detection ----
+
+// onDetect finds WOT runs with current settings and rebuilds the checklist.
+func (a *app) onDetect() {
+	if a.tbl == nil {
+		return
+	}
+	m, o, _, err := a.collect()
+	if err != nil {
+		a.log("検出エラー: %v", err)
+		return
+	}
+	if o.WOTThreshold <= 0 {
+		a.clearRunChecks()
+		a.log("WOT自動トリムが無効です（区間検出もスキップ）。")
+		return
+	}
+	segs, err := convert.FindSegments(a.tbl, m, o)
+	if err != nil {
+		a.clearRunChecks()
+		a.log("区間検出エラー: %v", err)
+		return
+	}
+	a.segs = segs
+	a.rebuildRunList()
+	if len(segs) == 0 {
+		a.log("TPS≥%.0f%% の区間は検出されませんでした（閾値を下げるか「すべて」設定で出力してください）。", o.WOTThreshold)
+	} else {
+		a.log("WOT区間 %d 件を検出しました。", len(segs))
+	}
+}
+
+func (a *app) onGearFilterChanged() {
+	if a.tbl == nil || a.runPanel == nil {
+		return
+	}
+	// ComboBox の CurrentIndexChanged 処理中にコントロールを破棄/生成すると、
+	// ドロップダウンの状態が壊れる。メッセージループの後半に延期する。
+	if a.detectQueued {
+		return
+	}
+	a.detectQueued = true
+	a.mw.Synchronize(func() {
+		a.detectQueued = false
+		a.onDetect()
+	})
+}
+
+func (a *app) clearRunChecks() {
+	for _, cb := range a.runChecks {
+		cb.Dispose()
+	}
+	a.runChecks = nil
+	a.runTags = nil
+}
+
+// rebuildRunList reuses existing checkboxes and only creates/disposes the
+// difference, so no control is destroyed while others are notifying events.
+func (a *app) rebuildRunList() {
+	for len(a.runChecks) > len(a.segs) {
+		i := len(a.runChecks) - 1
+		a.runChecks[i].Dispose()
+		a.runChecks = a.runChecks[:i]
+		a.runTags = a.runTags[:i]
+	}
+	for i, s := range a.segs {
+		if i >= len(a.runChecks) {
+			cb, err := walk.NewCheckBox(a.runPanel)
+			if err != nil {
+				a.log("チェックボックス作成失敗: %v", err)
+				return
+			}
+			a.runChecks = append(a.runChecks, cb)
+			a.runTags = append(a.runTags, 0)
+		}
+		a.runChecks[i].SetText(s.Describe())
+		a.runChecks[i].SetCheckState(walk.CheckChecked)
+		a.runTags[i] = s.Index
+	}
+	a.runPanel.Invalidate()
+}
+
+func (a *app) setAllChecks(v bool) {
+	state := walk.CheckUnchecked
+	if v {
+		state = walk.CheckChecked
+	}
+	for _, cb := range a.runChecks {
+		cb.SetCheckState(state)
+	}
+}
+
+func (a *app) checkedIndices() []int {
+	var out []int
+	for i, cb := range a.runChecks {
+		if cb.CheckState() == walk.CheckChecked && i < len(a.runTags) {
+			out = append(out, a.runTags[i])
+		}
+	}
+	return out
 }
 
 func gotDesc(tbl *pclinkcsv.Table, i int) string {
@@ -359,6 +486,7 @@ func (a *app) collect() (convert.Mapping, convert.Options, []string, error) {
 	case 1:
 		o.BoostOut = "kpa"
 	}
+	o.GearFilter = a.cbGearFilter.CurrentIndex() // 0=指定なし, n=ギアn
 	if a.chkWOT.CheckState() == walk.CheckChecked {
 		thr, err := strconv.ParseFloat(strings.TrimSpace(a.wotEdit.Text()), 64)
 		if err != nil || thr <= 0 {
@@ -398,6 +526,10 @@ func (a *app) onConvert() {
 		walk.MsgBox(a.mw, "設定エラー", err.Error(), walk.MsgBoxIconWarning)
 		return
 	}
+	if !(o.HasStart || o.HasEnd) && o.WOTThreshold > 0 {
+		a.convertSplits(m, o, extraHdrs)
+		return
+	}
 	res, err := convert.Run(a.tbl, m, o, extraHdrs)
 	if err != nil {
 		a.log("変換エラー: %v", err)
@@ -427,6 +559,59 @@ func (a *app) onConvert() {
 	a.log("%s", res.Stats.Describe())
 	a.log("出力: %s", dlg.FilePath)
 	a.log("Virtual Dyno: File→Load で開き、認識されない場合は Options→Columns&Profiles の Custom で列名を指定してください。")
+}
+
+// convertSplits writes each checked WOT segment to <name>_splitN.csv.
+func (a *app) convertSplits(m convert.Mapping, o convert.Options, extraHdrs []string) {
+	sel := a.checkedIndices()
+	if len(sel) == 0 {
+		// 一覧が未生成/閾値変更の可能性があるので一度検出し直す
+		a.onDetect()
+		sel = a.checkedIndices()
+	}
+	if len(sel) == 0 {
+		err := fmt.Errorf("出力する区間にチェックがありません。[区間を検出]を実行するか、WOTトリムを外して手動範囲/全ログで出力してください")
+		a.log("%v", err)
+		walk.MsgBox(a.mw, "変換エラー", err.Error(), walk.MsgBoxIconWarning)
+		return
+	}
+
+	def := strings.TrimSuffix(filepath.Base(a.inEdit.Text()), ".csv") + "_vd.csv"
+	dlg := walk.FileDialog{
+		Title:    "基準となる出力CSVファイル名を指定（splitN が付いて出力されます）",
+		FilePath: filepath.Join(filepath.Dir(a.inEdit.Text()), def),
+		Filter:   "CSV ファイル (*.csv)|*.csv",
+	}
+	ok, err := dlg.ShowSave(a.mw)
+	if err != nil {
+		a.log("ファイルダイアログエラー: %v", err)
+		return
+	}
+	if !ok {
+		return
+	}
+	base := strings.TrimSuffix(dlg.FilePath, filepath.Ext(dlg.FilePath))
+	n := 0
+	for _, idx := range sel {
+		o2 := o
+		o2.SegmentIndex = idx
+		res, err := convert.Run(a.tbl, m, o2, extraHdrs)
+		if err != nil {
+			a.log("split%d 変換エラー: %v", idx, err)
+			walk.MsgBox(a.mw, "変換エラー", fmt.Sprintf("split%d: %v", idx, err), walk.MsgBoxIconWarning)
+			continue
+		}
+		path := fmt.Sprintf("%s_split%d.csv", base, idx)
+		if err := convert.WriteCSV(path, res); err != nil {
+			a.log("split%d 出力エラー: %v", idx, err)
+			continue
+		}
+		a.log("split%d → %s（%d行 / %.1f s）", idx, filepath.Base(path), res.Stats.RowsOut, res.Stats.RunEnd-res.Stats.RunStart)
+		n++
+	}
+	if n > 0 {
+		a.log("%d 件のファイルを書き出しました。1ファイル=1回の全開加速として Virtual Dyno に取り込めます。", n)
+	}
 }
 
 // ---- presets ----
@@ -517,5 +702,9 @@ func (a *app) onLoadPreset() {
 	if p.Options.HasEnd {
 		a.endEdit.SetText(fmt.Sprintf("%g", p.Options.End))
 	}
+	if p.Options.GearFilter >= 0 && p.Options.GearFilter <= 8 {
+		a.cbGearFilter.SetCurrentIndex(p.Options.GearFilter)
+	}
+	a.onDetect()
 	a.log("プリセット読み込み: %s", filepath.Base(dlg.FilePath))
 }

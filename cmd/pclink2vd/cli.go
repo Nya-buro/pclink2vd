@@ -4,6 +4,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/nya-buro/pclink2vd/internal/convert"
@@ -15,6 +17,7 @@ import (
 //	pclink2vd -in log.csv -out out.csv [-preset name.json]
 //	          [-wot 90 | -full | -start 12.5 -end 22.0]
 //	          [-speed mph|kph] [-lambda auto|lambda|afr] [-boost psi|kpa]
+//	          [-gear 3] [-segments] [-split 1,2|all]
 func runCLI(args []string) int {
 	fs := flag.NewFlagSet("pclink2vd", flag.ContinueOnError)
 	in := fs.String("in", "", "入力: PCLink CSV エクスポートファイル")
@@ -27,6 +30,9 @@ func runCLI(args []string) int {
 	speed := fs.String("speed", "", "車速出力単位 mph|kph")
 	lambda := fs.String("lambda", "", "空燃比出力 auto|lambda|afr")
 	boost := fs.String("boost", "", "過給圧出力 psi|kpa")
+	gear := fs.Int("gear", -1, "WOT区間をこのギアに絞り込む (0以上)")
+	segments := fs.Bool("segments", false, "検出されるWOT区間を一覧表示して終了")
+	split := fs.String("split", "", "出力するWOT区間番号 (例: 1,3 または all)。-out名に _splitN が付く")
 	listCols := fs.Bool("list", false, "列一覧を表示して終了")
 
 	fs.Usage = func() {
@@ -54,7 +60,8 @@ func runCLI(args []string) int {
 		}
 		return 0
 	}
-	if *out == "" {
+	needOut := !*segments || *split != ""
+	if needOut && *out == "" {
 		fmt.Fprintln(os.Stderr, "エラー: -out を指定してください")
 		return 2
 	}
@@ -100,9 +107,66 @@ func runCLI(args []string) int {
 		o.WOTThreshold = 0
 	}
 
+	if *gear >= 0 {
+		o.GearFilter = *gear
+	}
+
 	extraHdrs := make([]string, 0, len(m.Extra))
 	for _, c := range m.Extra {
 		extraHdrs = append(extraHdrs, tbl.Header(c))
+	}
+
+	// 区間一覧モード: 検出結果を表示して終了
+	if *segments && *split == "" {
+		segs, err := convert.FindSegments(tbl, m, o)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "エラー:", err)
+			return 1
+		}
+		if len(segs) == 0 {
+			fmt.Fprintln(os.Stderr, "WOT区間が検出されませんでした（-wot の値を確認）")
+			return 1
+		}
+		for _, s := range segs {
+			fmt.Println(s.Describe())
+		}
+		return 0
+	}
+
+	// 分割出力モード: 指定区間を name_splitN.csv として個別出力
+	if *split != "" {
+		segs, err := convert.FindSegments(tbl, m, o)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "エラー:", err)
+			return 1
+		}
+		idxs, err := parseSplit(*split, segs)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "エラー:", err)
+			return 2
+		}
+		base := strings.TrimSuffix(*out, filepath.Ext(*out))
+		written := 0
+		for _, idx := range idxs {
+			o2 := o
+			o2.SegmentIndex = idx
+			res, err := convert.Run(tbl, m, o2, extraHdrs)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "split%d エラー: %v\n", idx, err)
+				continue
+			}
+			path := fmt.Sprintf("%s_split%d.csv", base, idx)
+			if err := convert.WriteCSV(path, res); err != nil {
+				fmt.Fprintf(os.Stderr, "split%d 出力エラー: %v\n", idx, err)
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "split%d → %s（%d行 / %.1f s）\n", idx, path, res.Stats.RowsOut, res.Stats.RunEnd-res.Stats.RunStart)
+			written++
+		}
+		if written == 0 {
+			return 1
+		}
+		return 0
 	}
 
 	res, err := convert.Run(tbl, m, o, extraHdrs)
@@ -123,4 +187,35 @@ func colDesc(tbl *pclinkcsv.Table, i int) string {
 		return "-"
 	}
 	return strings.TrimSpace(fmt.Sprintf("%d(%s)", i, tbl.Header(i)))
+}
+
+// parseSplit interprets the -split value ("all" or "1,3") against detected segments.
+func parseSplit(s string, segs []convert.Segment) ([]int, error) {
+	s = strings.TrimSpace(strings.ToLower(s))
+	if s == "all" {
+		var out []int
+		for _, sg := range segs {
+			out = append(out, sg.Index)
+		}
+		if len(out) == 0 {
+			return nil, fmt.Errorf("出力可能なWOT区間がありません")
+		}
+		return out, nil
+	}
+	valid := map[int]bool{}
+	for _, sg := range segs {
+		valid[sg.Index] = true
+	}
+	var out []int
+	for _, tok := range strings.Split(s, ",") {
+		n, err := strconv.Atoi(strings.TrimSpace(tok))
+		if err != nil || n < 1 {
+			return nil, fmt.Errorf("-split 指定不正: %s", tok)
+		}
+		if !valid[n] {
+			return nil, fmt.Errorf("区間%dは検出結果に存在しません（-segments で一覧確認できます）", n)
+		}
+		out = append(out, n)
+	}
+	return out, nil
 }

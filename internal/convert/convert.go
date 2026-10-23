@@ -45,6 +45,11 @@ type Options struct {
 	BoostOut string `json:"boostOut"`
 	// WOTThreshold: TPS %% considered "wide open throttle"; 0 disables auto trim.
 	WOTThreshold float64 `json:"wotThreshold"`
+	// GearFilter: when >0, WOT segment detection only keeps runs whose dominant
+	// gear equals this value (requires a mapped Gear column).
+	GearFilter int `json:"gearFilter"`
+	// SegmentIndex: 1-based index of the WOT run to export (0 = longest run).
+	SegmentIndex int `json:"segmentIndex"`
 	// Manual time window in seconds; HasStart/HasEnd enable either bound.
 	Start    float64 `json:"start"`
 	End      float64 `json:"end"`
@@ -104,12 +109,6 @@ type rec struct {
 
 // Run performs the conversion.
 func Run(src Source, m Mapping, o Options, extraHeaders []string) (*Result, error) {
-	if m.Time < 0 || m.RPM < 0 || m.Speed < 0 {
-		return nil, fmt.Errorf("Time / RPM / Speed の3列は必須です（未選択の項目があります）")
-	}
-	if o.WOTThreshold > 0 && m.TPS < 0 {
-		return nil, fmt.Errorf("WOT自動トリムにはTPS列の指定が必要です（チェックを外すかTPSを選択してください）")
-	}
 	if o.StoichAFR <= 0 {
 		o.StoichAFR = 14.7
 	}
@@ -120,35 +119,9 @@ func Run(src Source, m Mapping, o Options, extraHeaders []string) (*Result, erro
 	wantLambda := !strings.EqualFold(o.LambdaOut, "afr")
 
 	// 1) extract parseable rows
-	recs := make([]rec, 0, src.RowCount())
-	for r := 0; r < src.RowCount(); r++ {
-		var x rec
-		var ok bool
-		if x.t, ok = src.Num(r, m.Time); !ok {
-			continue
-		}
-		if x.rpm, ok = src.Num(r, m.RPM); !ok {
-			continue
-		}
-		if x.spd, ok = src.Num(r, m.Speed); !ok {
-			continue
-		}
-		if m.TPS >= 0 {
-			x.tps, x.hasTPS = src.Num(r, m.TPS)
-		}
-		if m.Lambda >= 0 {
-			x.lam, x.hasLAM = src.Num(r, m.Lambda)
-		}
-		if m.Boost >= 0 {
-			x.bst, x.hasBST = src.Num(r, m.Boost)
-		}
-		if m.Gear >= 0 {
-			x.gear, x.hasGear = src.Num(r, m.Gear)
-		}
-		for _, c := range m.Extra {
-			x.extra = append(x.extra, src.Cell(r, c))
-		}
-		recs = append(recs, x)
+	recs, err := collect(src, m, o)
+	if err != nil {
+		return nil, err
 	}
 	stats := Stats{RowsIn: src.RowCount(), LambdaFromAFR: srcIsAFR && wantLambda}
 
@@ -175,13 +148,27 @@ func Run(src Source, m Mapping, o Options, extraHeaders []string) (*Result, erro
 		if len(runs) == 0 {
 			return nil, fmt.Errorf("TPS≥%.0f%% の区間が見つかりませんでした。閾値を下げるか手動範囲を指定してください", o.WOTThreshold)
 		}
-		best := runs[0]
-		for _, r := range runs[1:] {
-			if r.length > best.length {
-				best = r
+		best := -1
+		if o.SegmentIndex >= 1 {
+			if o.SegmentIndex > len(runs) {
+				return nil, fmt.Errorf("区間%d が存在しません（検出されたWOT区間は %d 件です）", o.SegmentIndex, len(runs))
+			}
+			best = o.SegmentIndex - 1
+		} else {
+			// no explicit pick: longest run (optionally restricted by gear)
+			for i, r := range runs {
+				if o.GearFilter > 0 && dominantGear(recs[r.start:r.start+r.length]) != o.GearFilter {
+					continue
+				}
+				if best < 0 || r.length > runs[best].length {
+					best = i
+				}
+			}
+			if best < 0 {
+				return nil, fmt.Errorf("ギア%d のWOT区間が見つかりません（Gear列のマッピングを確認してください）", o.GearFilter)
 			}
 		}
-		seg = recs[best.start : best.start+best.length]
+		seg = recs[runs[best].start : runs[best].start+runs[best].length]
 	default:
 		stats.TrimMode = "all"
 	}
